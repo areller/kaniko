@@ -18,12 +18,11 @@ package util
 
 import (
 	"fmt"
-	"net/http"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
-	reflect "reflect"
 	"strconv"
 	"strings"
 
@@ -39,7 +38,7 @@ import (
 
 // for testing
 var (
-	getUIDAndGID = GetUIDAndGIDFromString
+	getUIDAndGIDFunc = getUIDAndGID
 )
 
 const (
@@ -71,7 +70,7 @@ func ResolveEnvironmentReplacementList(values, envs []string, isFilepath bool) (
 // "a\"b" -> "a"b"
 func ResolveEnvironmentReplacement(value string, envs []string, isFilepath bool) (string, error) {
 	shlex := shell.NewLex(parser.DefaultEscapeToken)
-	fp, err := shlex.ProcessWord(value, envs)
+	fp, _, err := shlex.ProcessWord(value, envs)
 	// Check after replacement if value is a remote URL
 	if !isFilepath || IsSrcRemoteFileURL(fp) {
 		return fp, err
@@ -89,16 +88,21 @@ func ResolveEnvironmentReplacement(value string, envs []string, isFilepath bool)
 
 func ResolveEnvAndWildcards(sd instructions.SourcesAndDest, fileContext FileContext, envs []string) ([]string, string, error) {
 	// First, resolve any environment replacement
-	resolvedEnvs, err := ResolveEnvironmentReplacementList(sd, envs, true)
+	resolvedEnvs, err := ResolveEnvironmentReplacementList(sd.SourcePaths, envs, true)
 	if err != nil {
 		return nil, "", errors.Wrap(err, "failed to resolve environment")
 	}
 	if len(resolvedEnvs) == 0 {
 		return nil, "", errors.New("resolved envs is empty")
 	}
-	dest := resolvedEnvs[len(resolvedEnvs)-1]
+	dests, err := ResolveEnvironmentReplacementList([]string{sd.DestPath}, envs, true)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "failed to resolve environment for dest path")
+	}
+	dest := dests[0]
+	sd.DestPath = dest
 	// Resolve wildcards and get a list of resolved sources
-	srcs, err := ResolveSources(resolvedEnvs[0:len(resolvedEnvs)-1], fileContext.Root)
+	srcs, err := ResolveSources(resolvedEnvs, fileContext.Root)
 	if err != nil {
 		return nil, "", errors.Wrap(err, "failed to resolve sources")
 	}
@@ -174,10 +178,14 @@ func IsDestDir(path string) bool {
 
 // DestinationFilepath returns the destination filepath from the build context to the image filesystem
 // If source is a file:
+//
 //	If dest is a dir, copy it to /dest/relpath
-// 	If dest is a file, copy directly to dest
+//	If dest is a file, copy directly to dest
+//
 // If source is a dir:
+//
 //	Assume dest is also a dir, and copy to dest/
+//
 // If dest is not an absolute filepath, add /cwd to the beginning
 func DestinationFilepath(src, dest, cwd string) (string, error) {
 	_, srcFileName := filepath.Split(src)
@@ -209,11 +217,17 @@ func URLDestinationFilepath(rawurl, dest, cwd string, envs []string) (string, er
 		}
 		return dest, nil
 	}
-	urlBase := filepath.Base(rawurl)
-	urlBase, err := ResolveEnvironmentReplacement(urlBase, envs, true)
+
+	urlBase, err := ResolveEnvironmentReplacement(rawurl, envs, true)
 	if err != nil {
 		return "", err
 	}
+
+	urlBase, err = extractFilename(urlBase)
+	if err != nil {
+		return "", err
+	}
+
 	destPath := filepath.Join(dest, urlBase)
 
 	if !filepath.IsAbs(dest) {
@@ -223,8 +237,8 @@ func URLDestinationFilepath(rawurl, dest, cwd string, envs []string) (string, er
 }
 
 func IsSrcsValid(srcsAndDest instructions.SourcesAndDest, resolvedSources []string, fileContext FileContext) error {
-	srcs := srcsAndDest[:len(srcsAndDest)-1]
-	dest := srcsAndDest[len(srcsAndDest)-1]
+	srcs := srcsAndDest.SourcePaths
+	dest := srcsAndDest.DestPath
 
 	if !ContainsWildcards(srcs) {
 		totalSrcs := 0
@@ -272,8 +286,10 @@ func IsSrcsValid(srcsAndDest instructions.SourcesAndDest, resolvedSources []stri
 			totalFiles++
 		}
 	}
+	// ignore the case where whildcards and there are no files to copy
 	if totalFiles == 0 {
-		return errors.New("copy failed: no source files specified")
+		// using log warning instead of return errors.New("copy failed: no source files specified")
+		logrus.Warn("No files to copy")
 	}
 	// If there are wildcards, and the destination is a file, there must be exactly one file to copy over,
 	// Otherwise, return an error
@@ -284,12 +300,8 @@ func IsSrcsValid(srcsAndDest instructions.SourcesAndDest, resolvedSources []stri
 }
 
 func IsSrcRemoteFileURL(rawurl string) bool {
-	_, err := url.ParseRequestURI(rawurl)
-	if err != nil {
-		return false
-	}
-	_, err = http.Get(rawurl)
-	return err == nil
+	u, err := url.ParseRequestURI(rawurl)
+	return err == nil && u.Scheme != "" && u.Host != ""
 }
 
 func UpdateConfigEnv(envVars []instructions.KeyValuePair, config *v1.Config, replacementEnvs []string) error {
@@ -353,7 +365,7 @@ func GetUserGroup(chownStr string, env []string) (int64, int64, error) {
 		return -1, -1, err
 	}
 
-	uid32, gid32, err := getUIDAndGID(chown, true)
+	uid32, gid32, err := getUIDAndGIDFromString(chown)
 	if err != nil {
 		return -1, -1, err
 	}
@@ -361,89 +373,137 @@ func GetUserGroup(chownStr string, env []string) (int64, int64, error) {
 	return int64(uid32), int64(gid32), nil
 }
 
+func GetChmod(chmodStr string, env []string) (chmod fs.FileMode, useDefault bool, err error) {
+	if chmodStr == "" {
+		return fs.FileMode(0o600), true, nil
+	}
+
+	chmodStr, err = ResolveEnvironmentReplacement(chmodStr, env, false)
+	if err != nil {
+		return 0, false, err
+	}
+
+	mode, err := strconv.ParseUint(chmodStr, 8, 32)
+	if err != nil {
+		return 0, false, errors.Wrap(err, "parsing value from chmod")
+	}
+	chmod = fs.FileMode(mode)
+	return
+}
+
 // Extract user and group id from a string formatted 'user:group'.
-// If fallbackToUID is set, the gid is equal to uid if the group is not specified
-// otherwise gid is set to zero.
-func GetUIDAndGIDFromString(userGroupString string, fallbackToUID bool) (uint32, uint32, error) {
+// UserID and GroupID don't need to be present on the system.
+func getUIDAndGIDFromString(userGroupString string) (uint32, uint32, error) {
 	userAndGroup := strings.Split(userGroupString, ":")
 	userStr := userAndGroup[0]
 	var groupStr string
 	if len(userAndGroup) > 1 {
 		groupStr = userAndGroup[1]
 	}
-
-	if reflect.TypeOf(userStr).String() == "int" {
-		return 0, 0, nil
-	}
-
-	uidStr, gidStr, err := GetUserFromUsername(userStr, groupStr, fallbackToUID)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	// uid and gid need to be fit into uint32
-	uid64, err := strconv.ParseUint(uidStr, 10, 32)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	gid64, err := strconv.ParseUint(gidStr, 10, 32)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	return uint32(uid64), uint32(gid64), nil
+	return getUIDAndGIDFunc(userStr, groupStr)
 }
 
-func GetUserFromUsername(userStr string, groupStr string, fallbackToUID bool) (string, string, error) {
-	// Lookup by username
-	userObj, err := Lookup(userStr)
+func getUIDAndGID(userStr string, groupStr string) (uint32, uint32, error) {
+	user, err := LookupUser(userStr)
 	if err != nil {
-		return "", "", err
+		return 0, 0, err
+	}
+	uid32, err := getUID(user.Uid)
+	if err != nil {
+		return 0, 0, err
 	}
 
-	// Same dance with groups
-	var group *user.Group
 	if groupStr != "" {
-		group, err = user.LookupGroup(groupStr)
+		gid32, err := getGIDFromName(groupStr)
 		if err != nil {
-			if _, ok := err.(user.UnknownGroupError); !ok {
-				return "", "", err
+			if errors.Is(err, fallbackToUIDError) {
+				return uid32, uid32, nil
 			}
-			group, err = user.LookupGroupId(groupStr)
-			if err != nil {
-				return "", "", err
-			}
+			return 0, 0, err
+		}
+		return uid32, gid32, nil
+	}
+
+	return uid32, uid32, nil
+}
+
+// getGID tries to parse the gid
+func getGID(groupStr string) (uint32, error) {
+	gid, err := strconv.ParseUint(groupStr, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(gid), nil
+}
+
+// getGIDFromName tries to parse the groupStr into an existing group.
+func getGIDFromName(groupStr string) (uint32, error) {
+	group, err := user.LookupGroup(groupStr)
+	if err != nil {
+		// unknown group error could relate to a non existing group
+		var groupErr user.UnknownGroupError
+		if errors.As(err, &groupErr) {
+			return getGID(groupStr)
+		}
+		group, err = user.LookupGroupId(groupStr)
+		if err != nil {
+			return getGID(groupStr)
 		}
 	}
-
-	uid := userObj.Uid
-	gid := "0"
-	if fallbackToUID {
-		gid = userObj.Gid
-	}
-	if group != nil {
-		gid = group.Gid
-	}
-
-	return uid, gid, nil
+	return getGID(group.Gid)
 }
 
-func Lookup(userStr string) (*user.User, error) {
+var fallbackToUIDError = new(fallbackToUIDErrorType)
+
+type fallbackToUIDErrorType struct{}
+
+func (e fallbackToUIDErrorType) Error() string {
+	return "fallback to uid"
+}
+
+// LookupUser will try to lookup the userStr inside the passwd file.
+// If the user does not exists, the function will fallback to parsing the userStr as an uid.
+func LookupUser(userStr string) (*user.User, error) {
 	userObj, err := user.Lookup(userStr)
 	if err != nil {
-		if _, ok := err.(user.UnknownUserError); !ok {
+		unknownUserErr := new(user.UnknownUserError)
+		// only return if it's not an unknown user error or the passwd file does not exist
+		if !errors.As(err, unknownUserErr) && !os.IsNotExist(err) {
 			return nil, err
 		}
 
 		// Lookup by id
-		u, e := user.LookupId(userStr)
-		if e != nil {
-			return nil, err
+		userObj, err = user.LookupId(userStr)
+		if err != nil {
+			uid, err := getUID(userStr)
+			if err != nil {
+				// at this point, the user does not exist and the userStr is not a valid number.
+				return nil, fmt.Errorf("user %v is not a uid and does not exist on the system", userStr)
+			}
+			userObj = &user.User{
+				Uid:     fmt.Sprint(uid),
+				HomeDir: "/",
+			}
 		}
-
-		userObj = u
 	}
-
 	return userObj, nil
+}
+
+func getUID(userStr string) (uint32, error) {
+	// checkif userStr is a valid id
+	uid, err := strconv.ParseUint(userStr, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(uid), nil
+}
+
+// ExtractFilename extracts the filename from a URL without its query url
+func extractFilename(rawURL string) (string, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	filename := filepath.Base(parsedURL.Path)
+	return filename, nil
 }

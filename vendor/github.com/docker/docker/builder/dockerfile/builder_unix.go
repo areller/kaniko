@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 package dockerfile // import "github.com/docker/docker/builder/dockerfile"
 

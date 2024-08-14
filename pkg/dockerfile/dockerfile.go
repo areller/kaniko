@@ -19,8 +19,9 @@ package dockerfile
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"github.com/GoogleContainerTools/kaniko/pkg/config"
 	"github.com/GoogleContainerTools/kaniko/pkg/util"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
+	"github.com/moby/buildkit/frontend/dockerfile/linter"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/pkg/errors"
 )
@@ -40,13 +42,13 @@ func ParseStages(opts *config.KanikoOptions) ([]instructions.Stage, []instructio
 	var d []uint8
 	match, _ := regexp.MatchString("^https?://", opts.DockerfilePath)
 	if match {
-		response, e := http.Get(opts.DockerfilePath)
+		response, e := http.Get(opts.DockerfilePath) //nolint:noctx
 		if e != nil {
 			return nil, nil, e
 		}
-		d, err = ioutil.ReadAll(response.Body)
+		d, err = io.ReadAll(response.Body)
 	} else {
-		d, err = ioutil.ReadFile(opts.DockerfilePath)
+		d, err = os.ReadFile(opts.DockerfilePath)
 	}
 
 	if err != nil {
@@ -58,7 +60,7 @@ func ParseStages(opts *config.KanikoOptions) ([]instructions.Stage, []instructio
 		return nil, nil, errors.Wrap(err, "parsing dockerfile")
 	}
 
-	metaArgs, err = expandNested(metaArgs, opts.BuildArgs)
+	metaArgs, err = expandNestedArgs(metaArgs, opts.BuildArgs)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "expanding meta ARGs")
 	}
@@ -72,7 +74,7 @@ func baseImageIndex(currentStage int, stages []instructions.Stage) int {
 	currentStageBaseName := strings.ToLower(stages[currentStage].BaseName)
 
 	for i, stage := range stages {
-		if i > currentStage {
+		if i >= currentStage {
 			break
 		}
 		if stage.Name == currentStageBaseName {
@@ -89,7 +91,7 @@ func Parse(b []byte) ([]instructions.Stage, []instructions.ArgCommand, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	stages, metaArgs, err := instructions.Parse(p.AST)
+	stages, metaArgs, err := instructions.Parse(p.AST, &linter.Linter{})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -103,7 +105,7 @@ func Parse(b []byte) ([]instructions.Stage, []instructions.ArgCommand, error) {
 }
 
 // expandNestedArgs tries to resolve nested ARG value against the previously defined ARGs
-func expandNested(metaArgs []instructions.ArgCommand, buildArgs []string) ([]instructions.ArgCommand, error) {
+func expandNestedArgs(metaArgs []instructions.ArgCommand, buildArgs []string) ([]instructions.ArgCommand, error) {
 	var prevArgs []string
 	for i, marg := range metaArgs {
 		for j, arg := range marg.Args {
@@ -176,7 +178,7 @@ func extractValFromQuotes(val string) (string, error) {
 	}
 
 	if leader != tail {
-		logrus.Infof("leader %s tail %s", leader, tail)
+		logrus.Infof("Leader %s tail %s", leader, tail)
 		return "", errors.New("quotes wrapping arg values must be matched")
 	}
 
@@ -197,7 +199,7 @@ func targetStage(stages []instructions.Stage, target string) (int, error) {
 		return len(stages) - 1, nil
 	}
 	for i, stage := range stages {
-		if stage.Name == target {
+		if strings.EqualFold(stage.Name, target) {
 			return i, nil
 		}
 	}

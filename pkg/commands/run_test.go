@@ -13,14 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package commands
 
 import (
 	"archive/tar"
 	"bytes"
-	"errors"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/user"
@@ -38,7 +37,6 @@ func Test_addDefaultHOME(t *testing.T) {
 		user        string
 		mockUser    *user.User
 		lookupError error
-		mockUserID  *user.User
 		initial     []string
 		expected    []string
 	}{
@@ -81,19 +79,18 @@ func Test_addDefaultHOME(t *testing.T) {
 			},
 		},
 		{
-			name:        "USER is set using the UID",
-			user:        "newuser",
-			lookupError: errors.New("User not found"),
-			mockUserID: &user.User{
-				Username: "user",
-				HomeDir:  "/home/user",
+			name: "USER is set using the UID",
+			user: "1000",
+			mockUser: &user.User{
+				Username: "1000",
+				HomeDir:  "/",
 			},
 			initial: []string{
 				"PATH=/something/else",
 			},
 			expected: []string{
 				"PATH=/something/else",
-				"HOME=/home/user",
+				"HOME=/",
 			},
 		},
 		{
@@ -113,11 +110,10 @@ func Test_addDefaultHOME(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			original := userLookup
 			userLookup = func(username string) (*user.User, error) { return test.mockUser, test.lookupError }
-			userLookupID = func(username string) (*user.User, error) { return test.mockUserID, nil }
 			defer func() {
-				userLookup = user.Lookup
-				userLookupID = user.LookupId
+				userLookup = original
 			}()
 			actual, err := addDefaultHOME(test.user, test.initial)
 			testutil.CheckErrorAndDeepEqual(t, false, err, test.expected, actual)
@@ -125,18 +121,15 @@ func Test_addDefaultHOME(t *testing.T) {
 	}
 }
 
-func prepareTarFixture(fileNames []string) ([]byte, error) {
-	dir, err := ioutil.TempDir("/tmp", "tar-fixture")
-	if err != nil {
-		return nil, err
-	}
+func prepareTarFixture(t *testing.T, fileNames []string) ([]byte, error) {
+	dir := t.TempDir()
 
 	content := `
 Meow meow meow meow
 meow meow meow meow
 `
 	for _, name := range fileNames {
-		if err := ioutil.WriteFile(filepath.Join(dir, name), []byte(content), 0777); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0777); err != nil {
 			return nil, err
 		}
 	}
@@ -159,7 +152,7 @@ meow meow meow meow
 		if err := tw.WriteHeader(hdr); err != nil {
 			log.Fatal(err)
 		}
-		body, err := ioutil.ReadFile(path)
+		body, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -174,7 +167,7 @@ meow meow meow meow
 }
 
 func Test_CachingRunCommand_ExecuteCommand(t *testing.T) {
-	tarContent, err := prepareTarFixture([]string{"foo.txt"})
+	tarContent, err := prepareTarFixture(t, []string{"foo.txt"})
 	if err != nil {
 		t.Errorf("couldn't prepare tar fixture %v", err)
 	}
@@ -210,7 +203,7 @@ func Test_CachingRunCommand_ExecuteCommand(t *testing.T) {
 				extractedFiles: []string{"/foo.txt"},
 				contextFiles:   []string{"foo.txt"},
 			}
-			c.extractFn = func(_ string, _ *tar.Header, _ io.Reader) error {
+			c.extractFn = func(_ string, _ *tar.Header, _ string, _ io.Reader) error {
 				*tc.count++
 				return nil
 			}
@@ -223,7 +216,7 @@ func Test_CachingRunCommand_ExecuteCommand(t *testing.T) {
 				desctiption: "with no image",
 				expectErr:   true,
 			}
-			c.extractFn = func(_ string, _ *tar.Header, _ io.Reader) error {
+			c.extractFn = func(_ string, _ *tar.Header, _ string, _ io.Reader) error {
 				return nil
 			}
 			tc.command = c
@@ -234,7 +227,7 @@ func Test_CachingRunCommand_ExecuteCommand(t *testing.T) {
 				img: fakeImage{},
 			}
 
-			c.extractFn = func(_ string, _ *tar.Header, _ io.Reader) error {
+			c.extractFn = func(_ string, _ *tar.Header, _ string, _ io.Reader) error {
 				return nil
 			}
 
@@ -252,7 +245,7 @@ func Test_CachingRunCommand_ExecuteCommand(t *testing.T) {
 					},
 				},
 			}
-			c.extractFn = func(_ string, _ *tar.Header, _ io.Reader) error {
+			c.extractFn = func(_ string, _ *tar.Header, _ string, _ io.Reader) error {
 				return nil
 			}
 			tc := testCase{
@@ -318,10 +311,7 @@ func Test_CachingRunCommand_ExecuteCommand(t *testing.T) {
 }
 
 func TestSetWorkDirIfExists(t *testing.T) {
-	testDir, err := ioutil.TempDir("", "workdir")
-	if err != nil {
-		t.Error(err)
-	}
+	testDir := t.TempDir()
 	testutil.CheckDeepEqual(t, testDir, setWorkDirIfExists(testDir))
 	testutil.CheckDeepEqual(t, "", setWorkDirIfExists("doesnot-exists"))
 }

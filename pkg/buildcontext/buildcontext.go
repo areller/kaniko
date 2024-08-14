@@ -32,6 +32,7 @@ type BuildOptions struct {
 	GitBranch            string
 	GitSingleBranch      bool
 	GitRecurseSubmodules bool
+	InsecureSkipTLS      bool
 }
 
 // BuildContext unifies calls to download and unpack the build context.
@@ -50,9 +51,9 @@ func GetBuildContext(srcContext string, opts BuildOptions) (BuildContext, error)
 
 		switch prefix {
 		case constants.GCSBuildContextPrefix:
-			return &GCS{context: context}, nil
+			return &GCS{context: srcContext}, nil
 		case constants.S3BuildContextPrefix:
-			return &S3{context: context}, nil
+			return &S3{context: srcContext}, nil
 		case constants.LocalDirBuildContextPrefix:
 			return &Dir{context: context}, nil
 		case constants.GitBuildContextPrefix:

@@ -17,7 +17,9 @@ limitations under the License.
 package util
 
 import (
+	"fmt"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/pkg/errors"
@@ -25,18 +27,19 @@ import (
 )
 
 func SyscallCredentials(userStr string) (*syscall.Credential, error) {
-	uid, gid, err := GetUIDAndGIDFromString(userStr, true)
+	uid, gid, err := getUIDAndGIDFromString(userStr)
 	if err != nil {
 		return nil, errors.Wrap(err, "get uid/gid")
 	}
 
-	u, err := Lookup(userStr)
+	u, err := LookupUser(fmt.Sprint(uid))
 	if err != nil {
 		return nil, errors.Wrap(err, "lookup")
 	}
-	logrus.Infof("util.Lookup returned: %+v", u)
+	logrus.Infof("Util.Lookup returned: %+v", u)
 
-	var groups []uint32
+	// initiliaze empty
+	groups := []uint32{}
 
 	gidStr, err := groupIDs(u)
 	if err != nil {
@@ -50,6 +53,12 @@ func SyscallCredentials(userStr string) (*syscall.Credential, error) {
 		}
 
 		groups = append(groups, uint32(i))
+	}
+
+	if !(len(strings.Split(userStr, ":")) > 1) {
+		if u.Gid != "" {
+			gid, _ = getGID(u.Gid)
+		}
 	}
 
 	return &syscall.Credential{

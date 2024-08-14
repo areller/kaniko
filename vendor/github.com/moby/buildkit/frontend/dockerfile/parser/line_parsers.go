@@ -8,7 +8,6 @@ package parser
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -34,7 +33,6 @@ func parseIgnore(rest string, d *directives) (*Node, map[string]bool, error) {
 // statement with sub-statements.
 //
 // ONBUILD RUN foo bar -> (onbuild (run foo bar))
-//
 func parseSubCommand(rest string, d *directives) (*Node, map[string]bool, error) {
 	if rest == "" {
 		return nil, nil, nil
@@ -154,30 +152,33 @@ func parseNameVal(rest string, key string, d *directives) (*Node, error) {
 	if !strings.Contains(words[0], "=") {
 		parts := reWhitespace.Split(rest, 2)
 		if len(parts) < 2 {
-			return nil, fmt.Errorf(key + " must have two arguments")
+			return nil, errors.Errorf("%s must have two arguments", key)
 		}
-		return newKeyValueNode(parts[0], parts[1]), nil
+		return newKeyValueNode(parts[0], parts[1], ""), nil
 	}
 
 	var rootNode *Node
 	var prevNode *Node
 	for _, word := range words {
 		if !strings.Contains(word, "=") {
-			return nil, fmt.Errorf("Syntax error - can't find = in %q. Must be of the form: name=value", word)
+			return nil, errors.Errorf("Syntax error - can't find = in %q. Must be of the form: name=value", word)
 		}
 
 		parts := strings.SplitN(word, "=", 2)
-		node := newKeyValueNode(parts[0], parts[1])
+		node := newKeyValueNode(parts[0], parts[1], "=")
 		rootNode, prevNode = appendKeyValueNode(node, rootNode, prevNode)
 	}
 
 	return rootNode, nil
 }
 
-func newKeyValueNode(key, value string) *Node {
+func newKeyValueNode(key, value, sep string) *Node {
 	return &Node{
 		Value: key,
-		Next:  &Node{Value: value},
+		Next: &Node{
+			Value: value,
+			Next:  &Node{Value: sep},
+		},
 	}
 }
 
@@ -189,7 +190,9 @@ func appendKeyValueNode(node, rootNode, prevNode *Node) (*Node, *Node) {
 		prevNode.Next = node
 	}
 
-	prevNode = node.Next
+	for prevNode = node.Next; prevNode.Next != nil; {
+		prevNode = prevNode.Next
+	}
 	return rootNode, prevNode
 }
 
@@ -271,10 +274,10 @@ func parseString(rest string, d *directives) (*Node, map[string]bool, error) {
 }
 
 // parseJSON converts JSON arrays to an AST.
-func parseJSON(rest string, d *directives) (*Node, map[string]bool, error) {
+func parseJSON(rest string) (*Node, map[string]bool, error) {
 	rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
 	if !strings.HasPrefix(rest, "[") {
-		return nil, nil, fmt.Errorf(`Error parsing "%s" as a JSON array`, rest)
+		return nil, nil, errors.Errorf("Error parsing %q as a JSON array", rest)
 	}
 
 	var myJSON []interface{}
@@ -309,7 +312,7 @@ func parseMaybeJSON(rest string, d *directives) (*Node, map[string]bool, error) 
 		return nil, nil, nil
 	}
 
-	node, attrs, err := parseJSON(rest, d)
+	node, attrs, err := parseJSON(rest)
 
 	if err == nil {
 		return node, attrs, nil
@@ -327,7 +330,7 @@ func parseMaybeJSON(rest string, d *directives) (*Node, map[string]bool, error) 
 // so, passes to parseJSON; if not, attempts to parse it as a whitespace
 // delimited string.
 func parseMaybeJSONToList(rest string, d *directives) (*Node, map[string]bool, error) {
-	node, attrs, err := parseJSON(rest, d)
+	node, attrs, err := parseJSON(rest)
 
 	if err == nil {
 		return node, attrs, nil

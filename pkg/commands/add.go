@@ -17,6 +17,7 @@ limitations under the License.
 package commands
 
 import (
+	"io/fs"
 	"path/filepath"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -38,14 +39,22 @@ type AddCommand struct {
 
 // ExecuteCommand executes the ADD command
 // Special stuff about ADD:
-// 	1. If <src> is a remote file URL:
-// 		- destination will have permissions of 0600
-// 		- If remote file has HTTP Last-Modified header, we set the mtime of the file to that timestamp
-// 		- If dest doesn't end with a slash, the filepath is inferred to be <dest>/<filename>
-// 	2. If <src> is a local tar archive:
-// 		- it is unpacked at the dest, as 'tar -x' would
+//  1. If <src> is a remote file URL:
+//     - destination will have permissions of 0600
+//     - If remote file has HTTP Last-Modified header, we set the mtime of the file to that timestamp
+//     - If dest doesn't end with a slash, the filepath is inferred to be <dest>/<filename>
+//  2. If <src> is a local tar archive:
+//     - it is unpacked at the dest, as 'tar -x' would
 func (a *AddCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.BuildArgs) error {
 	replacementEnvs := buildArgs.ReplacementEnvs(config.Env)
+
+	chmod, useDefaultChmod, err := util.GetChmod(a.cmd.Chmod, replacementEnvs)
+	if err != nil {
+		return errors.Wrap(err, "getting permissions from chmod")
+	}
+	if useDefaultChmod {
+		chmod = fs.FileMode(0o600)
+	}
 
 	uid, gid, err := util.GetUserGroup(a.cmd.Chown, replacementEnvs)
 	if err != nil {
@@ -71,7 +80,7 @@ func (a *AddCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bui
 				return err
 			}
 			logrus.Infof("Adding remote URL %s to %s", src, urlDest)
-			if err := util.DownloadFileToDest(src, urlDest, uid, gid); err != nil {
+			if err := util.DownloadFileToDest(src, urlDest, uid, gid, chmod); err != nil {
 				return errors.Wrap(err, "downloading remote source file")
 			}
 			a.snapshotFiles = append(a.snapshotFiles, urlDest)
@@ -98,8 +107,9 @@ func (a *AddCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bui
 
 	copyCmd := CopyCommand{
 		cmd: &instructions.CopyCommand{
-			SourcesAndDest: append(unresolvedSrcs, dest),
+			SourcesAndDest: instructions.SourcesAndDest{SourcePaths: unresolvedSrcs, DestPath: dest},
 			Chown:          a.cmd.Chown,
+			Chmod:          a.cmd.Chmod,
 		},
 		fileContext: a.fileContext,
 	}

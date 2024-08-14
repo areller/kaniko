@@ -17,10 +17,11 @@ limitations under the License.
 package snapshot
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"syscall"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/GoogleContainerTools/kaniko/pkg/util"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // For testing
@@ -49,6 +51,7 @@ func NewSnapshotter(l *LayeredMap, d string) *Snapshotter {
 
 // Init initializes a new snapshotter
 func (s *Snapshotter) Init() error {
+	logrus.Info("Initializing snapshotter ...")
 	_, _, err := s.scanFullFilesystem()
 	return err
 }
@@ -61,7 +64,7 @@ func (s *Snapshotter) Key() (string, error) {
 // TakeSnapshot takes a snapshot of the specified files, avoiding directories in the ignorelist, and creates
 // a tarball of the changed files. Return contents of the tarball, and whether or not any files were changed
 func (s *Snapshotter) TakeSnapshot(files []string, shdCheckDelete bool, forceBuildMetadata bool) (string, error) {
-	f, err := ioutil.TempFile(config.KanikoDir, "")
+	f, err := os.CreateTemp(config.KanikoDir, "")
 	if err != nil {
 		return "", err
 	}
@@ -75,41 +78,39 @@ func (s *Snapshotter) TakeSnapshot(files []string, shdCheckDelete bool, forceBui
 
 	filesToAdd, err := filesystem.ResolvePaths(files, s.ignorelist)
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 
 	logrus.Info("Taking snapshot of files...")
-	logrus.Debugf("Taking snapshot of files %v", filesToAdd)
 
 	sort.Strings(filesToAdd)
+	logrus.Debugf("Adding to layer: %v", filesToAdd)
 
-	// Add files to the layered map
+	// Add files to current layer.
 	for _, file := range filesToAdd {
 		if err := s.l.Add(file); err != nil {
-			return "", fmt.Errorf("unable to add file %s to layered map: %s", file, err)
+			return "", fmt.Errorf("Unable to add file %s to layered map: %w", file, err)
 		}
 	}
 
 	// Get whiteout paths
-	filesToWhiteout := []string{}
+	var filesToWhiteout []string
 	if shdCheckDelete {
-		_, deletedFiles := util.WalkFS(s.directory, s.l.getFlattenedPathsForWhiteOut(), func(s string) (bool, error) {
+		_, deletedFiles := util.WalkFS(s.directory, s.l.GetCurrentPaths(), func(s string) (bool, error) {
 			return true, nil
 		})
-		// The paths left here are the ones that have been deleted in this layer.
-		for path := range deletedFiles {
-			// Only add the whiteout if the directory for the file still exists.
-			dir := filepath.Dir(path)
-			if _, ok := deletedFiles[dir]; !ok {
-				if s.l.MaybeAddWhiteout(path) {
-					logrus.Debugf("Adding whiteout for %s", path)
-					filesToWhiteout = append(filesToWhiteout, path)
-				}
+
+		logrus.Debugf("Deleting in layer: %v", deletedFiles)
+		// Whiteout files in current layer.
+		for file := range deletedFiles {
+			if err := s.l.AddDelete(file); err != nil {
+				return "", fmt.Errorf("Unable to whiteout file %s in layered map: %w", file, err)
 			}
 		}
-	}
 
-	sort.Strings(filesToWhiteout)
+		filesToWhiteout = removeObsoleteWhiteouts(deletedFiles)
+		sort.Strings(filesToWhiteout)
+	}
 
 	t := util.NewTar(f)
 	defer t.Close()
@@ -122,7 +123,7 @@ func (s *Snapshotter) TakeSnapshot(files []string, shdCheckDelete bool, forceBui
 // TakeSnapshotFS takes a snapshot of the filesystem, avoiding directories in the ignorelist, and creates
 // a tarball of the changed files.
 func (s *Snapshotter) TakeSnapshotFS() (string, error) {
-	f, err := ioutil.TempFile(s.getSnashotPathPrefix(), "")
+	f, err := os.CreateTemp(s.getSnashotPathPrefix(), "")
 	if err != nil {
 		return "", err
 	}
@@ -155,11 +156,26 @@ func (s *Snapshotter) scanFullFilesystem() ([]string, []string, error) {
 	// for example the hashing function that determines if files are equal uses the mtime of the files,
 	// which can lag if sync is not called. Unfortunately there can still be lag if too much data needs
 	// to be flushed or the disk does its own caching/buffering.
-	syscall.Sync()
+	if runtime.GOOS == "linux" {
+		dir, err := os.Open(s.directory)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer dir.Close()
+		_, _, errno := syscall.Syscall(unix.SYS_SYNCFS, dir.Fd(), 0, 0)
+		if errno != 0 {
+			return nil, nil, errno
+		}
+	} else {
+		// fallback to full page cache sync
+		syscall.Sync()
+	}
 
 	s.l.Snapshot()
 
-	changedPaths, deletedPaths := util.WalkFS(s.directory, s.l.getFlattenedPathsForWhiteOut(), s.l.CheckFileChange)
+	logrus.Debugf("Current image filesystem: %v", s.l.currentImage)
+
+	changedPaths, deletedPaths := util.WalkFS(s.directory, s.l.GetCurrentPaths(), s.l.CheckFileChange)
 	timer := timing.Start("Resolving Paths")
 
 	filesToAdd := []string{}
@@ -169,64 +185,81 @@ func (s *Snapshotter) scanFullFilesystem() ([]string, []string, error) {
 	}
 	for _, path := range resolvedFiles {
 		if util.CheckIgnoreList(path) {
-			logrus.Tracef("Not adding %s to layer, as it's ignored", path)
+			logrus.Debugf("Not adding %s to layer, as it's ignored", path)
 			continue
 		}
 		filesToAdd = append(filesToAdd, path)
 	}
 
-	// The paths left here are the ones that have been deleted in this layer.
-	filesToWhiteOut := []string{}
-	for path := range deletedPaths {
-		// Only add the whiteout if the directory for the file still exists.
-		dir := filepath.Dir(path)
-		if _, ok := deletedPaths[dir]; !ok {
-			if s.l.MaybeAddWhiteout(path) {
-				logrus.Debugf("Adding whiteout for %s", path)
-				filesToWhiteOut = append(filesToWhiteOut, path)
-			}
-		}
-	}
-	timing.DefaultRun.Stop(timer)
-
-	sort.Strings(filesToAdd)
-	sort.Strings(filesToWhiteOut)
+	logrus.Debugf("Adding to layer: %v", filesToAdd)
+	logrus.Debugf("Deleting in layer: %v", deletedPaths)
 
 	// Add files to the layered map
 	for _, file := range filesToAdd {
 		if err := s.l.Add(file); err != nil {
-			return nil, nil, fmt.Errorf("unable to add file %s to layered map: %s", file, err)
+			return nil, nil, fmt.Errorf("Unable to add file %s to layered map: %w", file, err)
 		}
 	}
-	return filesToAdd, filesToWhiteOut, nil
+	for file := range deletedPaths {
+		if err := s.l.AddDelete(file); err != nil {
+			return nil, nil, fmt.Errorf("Unable to whiteout file %s in layered map: %w", file, err)
+		}
+	}
+
+	filesToWhiteout := removeObsoleteWhiteouts(deletedPaths)
+	timing.DefaultRun.Stop(timer)
+
+	sort.Strings(filesToAdd)
+	sort.Strings(filesToWhiteout)
+
+	return filesToAdd, filesToWhiteout, nil
+}
+
+// removeObsoleteWhiteouts filters deleted files according to their parents delete status.
+func removeObsoleteWhiteouts(deletedFiles map[string]struct{}) (filesToWhiteout []string) {
+
+	for path := range deletedFiles {
+		// Only add the whiteout if the directory for the file still exists.
+		dir := filepath.Dir(path)
+		if _, ok := deletedFiles[dir]; !ok {
+			logrus.Tracef("Adding whiteout for %s", path)
+			filesToWhiteout = append(filesToWhiteout, path)
+		}
+	}
+
+	return filesToWhiteout
 }
 
 func writeToTar(t util.Tar, files, whiteouts []string) error {
 	timer := timing.Start("Writing tar file")
 	defer timing.DefaultRun.Stop(timer)
+
 	// Now create the tar.
+	addedPaths := make(map[string]bool)
+
 	for _, path := range whiteouts {
+		skipWhiteout, err := parentPathIncludesNonDirectory(path)
+		if err != nil {
+			return err
+		}
+		if skipWhiteout {
+			continue
+		}
+
+		if err := addParentDirectories(t, addedPaths, path); err != nil {
+			return err
+		}
 		if err := t.Whiteout(path); err != nil {
 			return err
 		}
 	}
 
-	addedPaths := make(map[string]bool)
 	for _, path := range files {
-		if _, fileExists := addedPaths[path]; fileExists {
-			continue
+		if err := addParentDirectories(t, addedPaths, path); err != nil {
+			return err
 		}
-		for _, parentPath := range util.ParentDirectories(path) {
-			if parentPath == "/" {
-				continue
-			}
-			if _, dirExists := addedPaths[parentPath]; dirExists {
-				continue
-			}
-			if err := t.AddFileToTar(parentPath); err != nil {
-				return err
-			}
-			addedPaths[parentPath] = true
+		if _, pathAdded := addedPaths[path]; pathAdded {
+			continue
 		}
 		if err := t.AddFileToTar(path); err != nil {
 			return err
@@ -236,10 +269,38 @@ func writeToTar(t util.Tar, files, whiteouts []string) error {
 	return nil
 }
 
+// Returns true if a parent of the given path has been replaced with anything other than a directory
+func parentPathIncludesNonDirectory(path string) (bool, error) {
+	for _, parentPath := range util.ParentDirectories(path) {
+		lstat, err := os.Lstat(parentPath)
+		if err != nil {
+			return false, err
+		}
+
+		if !lstat.IsDir() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func addParentDirectories(t util.Tar, addedPaths map[string]bool, path string) error {
+	for _, parentPath := range util.ParentDirectories(path) {
+		if _, pathAdded := addedPaths[parentPath]; pathAdded {
+			continue
+		}
+		if err := t.AddFileToTar(parentPath); err != nil {
+			return err
+		}
+		addedPaths[parentPath] = true
+	}
+	return nil
+}
+
 // filesWithLinks returns the symlink and the target path if its exists.
 func filesWithLinks(path string) ([]string, error) {
 	link, err := util.GetSymLink(path)
-	if err == util.ErrNotSymLink {
+	if errors.Is(err, util.ErrNotSymLink) {
 		return []string{path}, nil
 	} else if err != nil {
 		return nil, err
@@ -249,7 +310,7 @@ func filesWithLinks(path string) ([]string, error) {
 		link = filepath.Join(filepath.Dir(path), link)
 	}
 	if _, err := os.Stat(link); err != nil {
-		return []string{path}, nil
+		return []string{path}, nil //nolint:nilerr
 	}
 	return []string{path, link}, nil
 }

@@ -22,7 +22,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +50,26 @@ func NewTar(f io.Writer) Tar {
 	}
 }
 
+func CreateTarballOfDirectory(pathToDir string, f io.Writer) error {
+	if !filepath.IsAbs(pathToDir) {
+		return errors.New("pathToDir is not absolute")
+	}
+	tarWriter := NewTar(f)
+	defer tarWriter.Close()
+
+	walkFn := func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("path %v is not absolute, cant read file", path)
+		}
+		return tarWriter.AddFileToTar(path)
+	}
+
+	return filepath.WalkDir(pathToDir, walkFn)
+}
+
 // Close will close any open streams used by Tar.
 func (t *Tar) Close() {
 	t.w.Close()
@@ -59,7 +79,7 @@ func (t *Tar) Close() {
 func (t *Tar) AddFileToTar(p string) error {
 	i, err := os.Lstat(p)
 	if err != nil {
-		return fmt.Errorf("Failed to get file info for %s: %s", p, err)
+		return fmt.Errorf("Failed to get file info for %s: %w", p, err)
 	}
 	linkDst := ""
 	if i.Mode()&os.ModeSymlink != 0 {
@@ -70,7 +90,7 @@ func (t *Tar) AddFileToTar(p string) error {
 		}
 	}
 	if i.Mode()&os.ModeSocket != 0 {
-		logrus.Infof("ignoring socket %s, not adding to tar", i.Name())
+		logrus.Infof("Ignoring socket %s, not adding to tar", i.Name())
 		return nil
 	}
 	hdr, err := tar.FileInfoHeader(i, linkDst)
@@ -127,15 +147,15 @@ const (
 	securityCapabilityXattr = "security.capability"
 )
 
-// writeSecurityXattrToTarHeader writes security.capability
-// xattrs from a a tar header to filesystem
-func writeSecurityXattrToToFile(path string, hdr *tar.Header) error {
+// writeSecurityXattrToTarFile writes security.capability
+// xattrs from a tar header to filesystem
+func writeSecurityXattrToTarFile(path string, hdr *tar.Header) error {
 	if hdr.Xattrs == nil {
 		return nil
 	}
 	if capability, ok := hdr.Xattrs[securityCapabilityXattr]; ok {
 		err := system.Lsetxattr(path, securityCapabilityXattr, []byte(capability), 0)
-		if err != nil && !errors.Is(err, syscall.EOPNOTSUPP) && err != system.ErrNotSupportedPlatform {
+		if err != nil && !errors.Is(err, syscall.EOPNOTSUPP) && !errors.Is(err, system.ErrNotSupportedPlatform) {
 			return errors.Wrapf(err, "failed to write %q attribute to %q", securityCapabilityXattr, path)
 		}
 	}
@@ -149,7 +169,7 @@ func readSecurityXattrToTarHeader(path string, hdr *tar.Header) error {
 		hdr.Xattrs = make(map[string]string)
 	}
 	capability, err := system.Lgetxattr(path, securityCapabilityXattr)
-	if err != nil && !errors.Is(err, syscall.EOPNOTSUPP) && err != system.ErrNotSupportedPlatform {
+	if err != nil && !errors.Is(err, syscall.EOPNOTSUPP) && !errors.Is(err, system.ErrNotSupportedPlatform) {
 		return errors.Wrapf(err, "failed to read %q attribute from %q", securityCapabilityXattr, path)
 	}
 	if capability != nil {
@@ -160,7 +180,7 @@ func readSecurityXattrToTarHeader(path string, hdr *tar.Header) error {
 
 func (t *Tar) Whiteout(p string) error {
 	dir := filepath.Dir(p)
-	name := ".wh." + filepath.Base(p)
+	name := archive.WhiteoutPrefix + filepath.Base(p)
 
 	th := &tar.Header{
 		// Docker uses no leading / in the tarball
@@ -215,7 +235,12 @@ func UnpackLocalTarArchive(path, dest string) ([]string, error) {
 		}
 		defer file.Close()
 		if compressionLevel == archive.Gzip {
-			return nil, UnpackCompressedTar(path, dest)
+			gzr, err := gzip.NewReader(file)
+			if err != nil {
+				return nil, err
+			}
+			defer gzr.Close()
+			return UnTar(gzr, dest)
 		} else if compressionLevel == archive.Bzip2 {
 			bzr := bzip2.NewReader(file)
 			return UnTar(bzr, dest)
@@ -232,7 +257,7 @@ func UnpackLocalTarArchive(path, dest string) ([]string, error) {
 	return nil, errors.New("path does not lead to local tar archive")
 }
 
-//IsFileLocalTarArchive returns true if the file is a local tar archive
+// IsFileLocalTarArchive returns true if the file is a local tar archive
 func IsFileLocalTarArchive(src string) bool {
 	compressed, _ := fileIsCompressedTar(src)
 	uncompressed := fileIsUncompressedTar(src)
@@ -245,7 +270,7 @@ func fileIsCompressedTar(src string) (bool, archive.Compression) {
 		return false, -1
 	}
 	defer r.Close()
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return false, -1
 	}

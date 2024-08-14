@@ -18,7 +18,6 @@ package dockerfile
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -45,7 +44,7 @@ func Test_ParseStages_ArgValueWithQuotes(t *testing.T) {
 	FROM scratch
 	COPY --from=second /hi2 /hi3
 	`
-	tmpfile, err := ioutil.TempFile("", "Dockerfile.test")
+	tmpfile, err := os.CreateTemp("", "Dockerfile.test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,11 +216,11 @@ func Test_GetOnBuildInstructions(t *testing.T) {
 			stageToIdx: map[string]string{"builder": "0", "temp": "1"},
 			expCommands: []instructions.Command{
 				&instructions.CopyCommand{
-					SourcesAndDest: []string{"a.txt b.txt"},
+					SourcesAndDest: instructions.SourcesAndDest{SourcePaths: []string{"a.txt"}, DestPath: "b.txt"},
 					From:           "0",
 				},
 				&instructions.CopyCommand{
-					SourcesAndDest: []string{"/app /app"},
+					SourcesAndDest: instructions.SourcesAndDest{SourcePaths: []string{"/app"}, DestPath: "/app"},
 					From:           "1",
 				},
 			}},
@@ -261,6 +260,9 @@ func Test_targetStage(t *testing.T) {
 	FROM scratch AS second
 	COPY --from=0 /hi /hi2
 
+	FROM scratch AS UPPER_CASE
+	COPY --from=0 /hi /hi2
+
 	FROM scratch
 	COPY --from=second /hi2 /hi3
 	`
@@ -281,9 +283,15 @@ func Test_targetStage(t *testing.T) {
 			shouldErr:   false,
 		},
 		{
+			name:        "test valid upper case target",
+			target:      "UPPER_CASE",
+			targetIndex: 2,
+			shouldErr:   false,
+		},
+		{
 			name:        "test no target",
 			target:      "",
-			targetIndex: 2,
+			targetIndex: 3,
 			shouldErr:   false,
 		},
 		{
@@ -557,7 +565,7 @@ func Test_SkipingUnusedStages(t *testing.T) {
 		{
 			description: "dockerfile_with_two_copyFrom_and_arg",
 			dockerfile: `
-			FROM debian:9.11 as base
+			FROM debian:10.13 as base
 			COPY . .
 			FROM scratch as second
 			ENV foopath context/foo
@@ -574,13 +582,13 @@ func Test_SkipingUnusedStages(t *testing.T) {
 			FROM fourth
 			ARG file=/foo2
 			COPY --from=second /foo ${file}
-			COPY --from=debian:9.11 /etc/os-release /new
+			COPY --from=debian:10.13 /etc/os-release /new
 			`,
 			targets: []string{"base", ""},
 			expectedSourceCodes: map[string][]string{
-				"base":   {"FROM debian:9.11 as base"},
-				"second": {"FROM debian:9.11 as base", "FROM scratch as second"},
-				"":       {"FROM debian:9.11 as base", "FROM scratch as second", "FROM base as fourth", "FROM fourth"},
+				"base":   {"FROM debian:10.13 as base"},
+				"second": {"FROM debian:10.13 as base", "FROM scratch as second"},
+				"":       {"FROM debian:10.13 as base", "FROM scratch as second", "FROM base as fourth", "FROM fourth"},
 			},
 			expectedTargetIndexBeforeSkip: map[string]int{
 				"base":   0,
@@ -597,9 +605,9 @@ func Test_SkipingUnusedStages(t *testing.T) {
 			description: "dockerfile_without_final_dependencies",
 			dockerfile: `
 			FROM alpine:3.11
-			FROM debian:9.11 as base
+			FROM debian:10.13 as base
 			RUN echo foo > /foo
-			FROM debian:9.11 as fizz
+			FROM debian:10.13 as fizz
 			RUN echo fizz >> /fizz
 			COPY --from=base /foo /fizz
 			FROM alpine:3.11 as buzz
@@ -611,8 +619,8 @@ func Test_SkipingUnusedStages(t *testing.T) {
 			expectedSourceCodes: map[string][]string{
 				"final": {"FROM alpine:3.11 as final"},
 				"buzz":  {"FROM alpine:3.11 as buzz"},
-				"fizz":  {"FROM debian:9.11 as base", "FROM debian:9.11 as fizz"},
-				"":      {"FROM alpine:3.11", "FROM debian:9.11 as base", "FROM debian:9.11 as fizz", "FROM alpine:3.11 as buzz", "FROM alpine:3.11 as final"},
+				"fizz":  {"FROM debian:10.13 as base", "FROM debian:10.13 as fizz"},
+				"":      {"FROM alpine:3.11", "FROM debian:10.13 as base", "FROM debian:10.13 as fizz", "FROM alpine:3.11 as buzz", "FROM alpine:3.11 as final"},
 			},
 			expectedTargetIndexBeforeSkip: map[string]int{
 				"final": 4,

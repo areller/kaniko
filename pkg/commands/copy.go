@@ -53,13 +53,20 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 
 	replacementEnvs := buildArgs.ReplacementEnvs(config.Env)
 	uid, gid, err := getUserGroup(c.cmd.Chown, replacementEnvs)
+	logrus.Debugf("found uid %v and gid %v for chown string %v", uid, gid, c.cmd.Chown)
 	if err != nil {
 		return errors.Wrap(err, "getting user group from chown")
 	}
 
+	// sources from the Copy command are resolved with wildcards {*?[}
 	srcs, dest, err := util.ResolveEnvAndWildcards(c.cmd.SourcesAndDest, c.fileContext, replacementEnvs)
 	if err != nil {
 		return errors.Wrap(err, "resolving src")
+	}
+
+	chmod, useDefaultChmod, err := util.GetChmod(c.cmd.Chmod, replacementEnvs)
+	if err != nil {
+		return errors.Wrap(err, "getting permissions from chmod")
 	}
 
 	// For each source, iterate through and copy it over
@@ -91,7 +98,7 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 		}
 
 		if fi.IsDir() {
-			copiedFiles, err := util.CopyDir(fullPath, destPath, c.fileContext, uid, gid)
+			copiedFiles, err := util.CopyDir(fullPath, destPath, c.fileContext, uid, gid, chmod, useDefaultChmod)
 			if err != nil {
 				return errors.Wrap(err, "copying dir")
 			}
@@ -108,7 +115,7 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 			c.snapshotFiles = append(c.snapshotFiles, destPath)
 		} else {
 			// ... Else, we want to copy over a file
-			exclude, err := util.CopyFile(fullPath, destPath, c.fileContext, uid, gid)
+			exclude, err := util.CopyFile(fullPath, destPath, c.fileContext, uid, gid, chmod, useDefaultChmod)
 			if err != nil {
 				return errors.Wrap(err, "copying file")
 			}
@@ -191,7 +198,7 @@ func (cr *CachingCopyCommand) ExecuteCommand(config *v1.Config, buildArgs *docke
 	cr.layer = layers[0]
 	cr.extractedFiles, err = util.GetFSFromLayers(kConfig.RootDir, layers, util.ExtractFunc(cr.extractFn), util.IncludeWhiteout())
 
-	logrus.Debugf("extractedFiles: %s", cr.extractedFiles)
+	logrus.Debugf("ExtractedFiles: %s", cr.extractedFiles)
 	if err != nil {
 		return errors.Wrap(err, "extracting fs from image")
 	}
@@ -269,9 +276,8 @@ func copyCmdFilesUsedFromContext(
 	config *v1.Config, buildArgs *dockerfile.BuildArgs, cmd *instructions.CopyCommand,
 	fileContext util.FileContext,
 ) ([]string, error) {
-	// We don't use the context if we're performing a copy --from.
 	if cmd.From != "" {
-		return nil, nil
+		fileContext = util.FileContext{Root: filepath.Join(kConfig.KanikoDir, cmd.From)}
 	}
 
 	replacementEnvs := buildArgs.ReplacementEnvs(config.Env)

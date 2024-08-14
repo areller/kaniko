@@ -58,15 +58,19 @@ type DockerCommand interface {
 
 	// ShouldDetectDeletedFiles returns true if the command could delete files.
 	ShouldDetectDeletedFiles() bool
+
+	// True if need add ARGs and EVNs to composite cache string with resolved command
+	// need only for RUN instruction
+	IsArgsEnvsRequiredInCache() bool
 }
 
-func GetCommand(cmd instructions.Command, fileContext util.FileContext, useNewRun bool, cacheCopy bool) (DockerCommand, error) {
+func GetCommand(cmd instructions.Command, fileContext util.FileContext, useNewRun bool, cacheCopy bool, cacheRun bool) (DockerCommand, error) {
 	switch c := cmd.(type) {
 	case *instructions.RunCommand:
 		if useNewRun {
-			return &RunMarkerCommand{cmd: c}, nil
+			return &RunMarkerCommand{cmd: c, shdCache: cacheRun}, nil
 		}
-		return &RunCommand{cmd: c}, nil
+		return &RunCommand{cmd: c, shdCache: cacheRun}, nil
 	case *instructions.CopyCommand:
 		return &CopyCommand{cmd: c, fileContext: fileContext, shdCache: cacheCopy}, nil
 	case *instructions.ExposeCommand:

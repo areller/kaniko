@@ -17,7 +17,6 @@ limitations under the License.
 package util
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,11 +32,7 @@ func TestDockerConfLocationWithInvalidFileLocation(t *testing.T) {
 	if err := os.Unsetenv(DockerConfigEnvKey); err != nil {
 		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
 	}
-	tmpDir, err := ioutil.TempDir("", "*")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 	random := "fdgdsfrdfgdf-fdfsf-24dsgfd" //replace with a really random string
 	file := filepath.Join(tmpDir, random)  // an random file name, shouldn't exist
 	if err := os.Setenv(DockerConfigEnvKey, file); err != nil {
@@ -63,11 +58,7 @@ func TestDockerConfLocation(t *testing.T) {
 	if unset != unsetExpected {
 		t.Errorf("Unexpected default Docker configuration file location: expected:'%s' got:'%s'", unsetExpected, unset)
 	}
-	tmpDir, err := ioutil.TempDir("", "*")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	dir := filepath.Join(tmpDir, "/kaniko/.docker")
 	os.MkdirAll(dir, os.ModePerm)
@@ -80,11 +71,7 @@ func TestDockerConfLocation(t *testing.T) {
 		t.Errorf("Unexpected kaniko default Docker conf file location: expected:'%s' got:'%s'", kanikoDefaultExpected, kanikoDefault)
 	}
 
-	differentPath, err := ioutil.TempDir("", "differentPath")
-	if err != nil {
-		t.Fatalf("could not create temp dir: %s", err)
-	}
-	defer os.RemoveAll(differentPath)
+	differentPath := t.TempDir()
 	if err := os.Setenv(DockerConfigEnvKey, differentPath); err != nil {
 		t.Fatalf("Failed to set DOCKER_CONFIG: %v", err)
 	}
@@ -113,7 +100,7 @@ func TestDockerConfLocationWithFileLocation(t *testing.T) {
 	if err := os.Unsetenv(DockerConfigEnvKey); err != nil {
 		t.Fatalf("Failed to unset DOCKER_CONFIG: %v", err)
 	}
-	file, err := ioutil.TempFile("", "docker.conf")
+	file, err := os.CreateTemp("", "docker.conf")
 	if err != nil {
 		t.Fatalf("could not create temp file: %s", err)
 	}

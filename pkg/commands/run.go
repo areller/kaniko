@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/user"
 	"strings"
 	"syscall"
 
@@ -36,14 +35,18 @@ import (
 
 type RunCommand struct {
 	BaseCommand
-	cmd *instructions.RunCommand
+	cmd      *instructions.RunCommand
+	shdCache bool
 }
 
 // for testing
 var (
-	userLookup   = user.Lookup
-	userLookupID = user.LookupId
+	userLookup = util.LookupUser
 )
+
+func (r *RunCommand) IsArgsEnvsRequiredInCache() bool {
+	return true
+}
 
 func (r *RunCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.BuildArgs) error {
 	return runCommandInExec(config, buildArgs, r.cmd)
@@ -80,8 +83,8 @@ func runCommandInExec(config *v1.Config, buildArgs *dockerfile.BuildArgs, cmdRun
 		}
 	}
 
-	logrus.Infof("cmd: %s", newCommand[0])
-	logrus.Infof("args: %s", newCommand[1:])
+	logrus.Infof("Cmd: %s", newCommand[0])
+	logrus.Infof("Args: %s", newCommand[1:])
 
 	cmd := exec.Command(newCommand[0], newCommand[1:]...)
 
@@ -151,11 +154,7 @@ func addDefaultHOME(u string, envs []string) ([]string, error) {
 	// Otherwise the user is set to uid and HOME is /
 	userObj, err := userLookup(u)
 	if err != nil {
-		if uo, e := userLookupID(u); e == nil {
-			userObj = uo
-		} else {
-			return nil, err
-		}
+		return nil, fmt.Errorf("lookup user %v: %w", u, err)
 	}
 
 	return append(envs, fmt.Sprintf("%s=%s", constants.HOME, userObj.HomeDir)), nil
@@ -193,7 +192,7 @@ func (r *RunCommand) RequiresUnpackedFS() bool {
 }
 
 func (r *RunCommand) ShouldCacheOutput() bool {
-	return true
+	return r.shdCache
 }
 
 type CachingRunCommand struct {
@@ -203,6 +202,10 @@ type CachingRunCommand struct {
 	extractedFiles []string
 	cmd            *instructions.RunCommand
 	extractFn      util.ExtractFunction
+}
+
+func (cr *CachingRunCommand) IsArgsEnvsRequiredInCache() bool {
+	return true
 }
 
 func (cr *CachingRunCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.BuildArgs) error {
@@ -256,6 +259,7 @@ func (cr *CachingRunCommand) MetadataOnly() bool {
 	return false
 }
 
+// todo: this should create the workdir if it doesn't exist, atleast this is what docker does
 func setWorkDirIfExists(workdir string) string {
 	if _, err := os.Lstat(workdir); err == nil {
 		return workdir

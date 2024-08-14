@@ -50,7 +50,7 @@ const (
 
 var (
 	// List of drivers that should be used in an order
-	priority = "btrfs,zfs,overlay2,fuse-overlayfs,aufs,overlay,devicemapper,vfs"
+	priority = "overlay2,fuse-overlayfs,btrfs,zfs,vfs"
 
 	// FsNames maps filesystem id to name of the filesystem.
 	FsNames = map[FsMagic]string{
@@ -99,8 +99,8 @@ type fsChecker struct {
 }
 
 func (c *fsChecker) IsMounted(path string) bool {
-	m, _ := Mounted(c.t, path)
-	return m
+	fsType, _ := GetFSMagic(path)
+	return fsType == c.t
 }
 
 // NewDefaultChecker returns a check that parses /proc/mountinfo to check
@@ -109,22 +109,9 @@ func NewDefaultChecker() Checker {
 	return &defaultChecker{}
 }
 
-type defaultChecker struct {
-}
+type defaultChecker struct{}
 
 func (c *defaultChecker) IsMounted(path string) bool {
 	m, _ := mountinfo.Mounted(path)
 	return m
-}
-
-// Mounted checks if the given path is mounted as the fs type
-func Mounted(fsType FsMagic, mountPath string) (bool, error) {
-	var buf unix.Statfs_t
-	if err := unix.Statfs(mountPath, &buf); err != nil {
-		if err == unix.ENOENT { // not exist, thus not mounted
-			err = nil
-		}
-		return false, err
-	}
-	return FsMagic(buf.Type) == fsType, nil
 }

@@ -20,8 +20,8 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"strconv"
@@ -30,7 +30,9 @@ import (
 	"time"
 
 	"github.com/minio/highwayhash"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // Hasher returns a hash function, used in snapshotting to determine if a file has changed
@@ -56,6 +58,10 @@ func Hasher() func(string) (string, error) {
 		h.Write([]byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Gid), 36)))
 
 		if fi.Mode().IsRegular() {
+			capability, _ := Lgetxattr(p, "security.capability")
+			if capability != nil {
+				h.Write(capability)
+			}
 			f, err := os.Open(p)
 			if err != nil {
 				return "", err
@@ -66,6 +72,12 @@ func Hasher() func(string) (string, error) {
 			if _, err := io.CopyBuffer(h, f, *buf); err != nil {
 				return "", err
 			}
+		} else if fi.Mode()&os.ModeSymlink == os.ModeSymlink {
+			linkPath, err := os.Readlink(p)
+			if err != nil {
+				return "", err
+			}
+			h.Write([]byte(linkPath))
 		}
 
 		return hex.EncodeToString(h.Sum(nil)), nil
@@ -96,6 +108,12 @@ func CacheHasher() func(string) (string, error) {
 			if _, err := io.Copy(h, f); err != nil {
 				return "", err
 			}
+		} else if fi.Mode()&os.ModeSymlink == os.ModeSymlink {
+			linkPath, err := os.Readlink(p)
+			if err != nil {
+				return "", err
+			}
+			h.Write([]byte(linkPath))
 		}
 
 		return hex.EncodeToString(h.Sum(nil)), nil
@@ -127,6 +145,12 @@ func RedoHasher() func(string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+
+		logrus.Debugf("Hash components for file: %s, mode: %s, mtime: %s, size: %s, user-id: %s, group-id: %s",
+			p, []byte(fi.Mode().String()), []byte(fi.ModTime().String()),
+			[]byte(strconv.FormatInt(fi.Size(), 16)), []byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Uid), 36)),
+			[]byte(strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Gid), 36)))
+
 		h.Write([]byte(fi.Mode().String()))
 		h.Write([]byte(fi.ModTime().String()))
 		h.Write([]byte(strconv.FormatInt(fi.Size(), 16)))
@@ -151,7 +175,7 @@ func SHA256(r io.Reader) (string, error) {
 
 // GetInputFrom returns Reader content
 func GetInputFrom(r io.Reader) ([]byte, error) {
-	output, err := ioutil.ReadAll(r)
+	output, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -171,4 +195,49 @@ func Retry(operation retryFunc, retryCount int, initialDelayMilliseconds int) er
 	}
 
 	return err
+}
+
+// Retry retries an operation with a return value
+func RetryWithResult[T any](operation func() (T, error), retryCount int, initialDelayMilliseconds int) (result T, err error) {
+	result, err = operation()
+	if err == nil {
+		return result, nil
+	}
+	for i := 0; i < retryCount; i++ {
+		sleepDuration := time.Millisecond * time.Duration(int(math.Pow(2, float64(i)))*initialDelayMilliseconds)
+		logrus.Warnf("Retrying operation after %s due to %v", sleepDuration, err)
+		time.Sleep(sleepDuration)
+
+		result, err = operation()
+		if err == nil {
+			return result, nil
+		}
+	}
+
+	return result, fmt.Errorf("unable to complete operation after %d attempts, last error: %w", retryCount, err)
+}
+
+func Lgetxattr(path string, attr string) ([]byte, error) {
+	// Start with a 128 length byte array
+	dest := make([]byte, 128)
+	sz, errno := unix.Lgetxattr(path, attr, dest)
+
+	for errors.Is(errno, unix.ERANGE) {
+		// Buffer too small, use zero-sized buffer to get the actual size
+		sz, errno = unix.Lgetxattr(path, attr, []byte{})
+		if errno != nil {
+			return nil, errno
+		}
+		dest = make([]byte, sz)
+		sz, errno = unix.Lgetxattr(path, attr, dest)
+	}
+
+	switch {
+	case errors.Is(errno, unix.ENODATA):
+		return nil, nil
+	case errno != nil:
+		return nil, errno
+	}
+
+	return dest[:sz], nil
 }

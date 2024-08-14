@@ -5,7 +5,11 @@
 package gensupport
 
 import (
+	"errors"
 	"io"
+	"net"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/googleapis/gax-go/v2"
@@ -20,14 +24,12 @@ type Backoff interface {
 
 // These are declared as global variables so that tests can overwrite them.
 var (
-	// Per-chunk deadline for resumable uploads.
-	retryDeadline = 32 * time.Second
+	// Default per-chunk deadline for resumable uploads.
+	defaultRetryDeadline = 32 * time.Second
 	// Default backoff timer.
 	backoff = func() Backoff {
 		return &gax.Backoff{Initial: 100 * time.Millisecond}
 	}
-	// syscallRetryable is a platform-specific hook, specified in retryable_linux.go
-	syscallRetryable func(error) bool = func(err error) bool { return false }
 )
 
 const (
@@ -36,6 +38,10 @@ const (
 	// should be retried.
 	// https://cloud.google.com/storage/docs/json_api/v1/status-codes#standardcodes
 	statusTooManyRequests = 429
+
+	// statusRequestTimeout is returned by the storage API if the
+	// upload connection was broken. The request should be retried.
+	statusRequestTimeout = 408
 )
 
 // shouldRetry indicates whether an error is retryable for the purposes of this
@@ -46,25 +52,36 @@ func shouldRetry(status int, err error) bool {
 	if 500 <= status && status <= 599 {
 		return true
 	}
-	if status == statusTooManyRequests {
+	if status == statusTooManyRequests || status == statusRequestTimeout {
 		return true
 	}
-	if err == io.ErrUnexpectedEOF {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	// Transient network errors should be retried.
-	if syscallRetryable(err) {
+	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
-	if err, ok := err.(interface{ Temporary() bool }); ok {
-		if err.Temporary() {
+	switch e := err.(type) {
+	case *net.OpError, *url.Error:
+		// Retry socket-level errors ECONNREFUSED and ECONNRESET (from syscall).
+		// Unfortunately the error type is unexported, so we resort to string
+		// matching.
+		retriable := []string{"connection refused", "connection reset", "broken pipe"}
+		for _, s := range retriable {
+			if strings.Contains(e.Error(), s) {
+				return true
+			}
+		}
+	case interface{ Temporary() bool }:
+		if e.Temporary() {
 			return true
 		}
 	}
-	// If Go 1.13 error unwrapping is available, use this to examine wrapped
+
+	// If error unwrapping is available, use this to examine wrapped
 	// errors.
-	if err, ok := err.(interface{ Unwrap() error }); ok {
-		return shouldRetry(status, err.Unwrap())
+	if e, ok := err.(interface{ Unwrap() error }); ok {
+		return shouldRetry(status, e.Unwrap())
 	}
 	return false
 }

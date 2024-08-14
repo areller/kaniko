@@ -19,7 +19,7 @@ package integration
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,7 +60,7 @@ func TestSnapshotBenchmark(t *testing.T) {
 				buildArgs := []string{"--build-arg", fmt.Sprintf("NUM=%d", num)}
 				var benchmarkDir string
 				benchmarkDir, *err = buildKanikoImage(t.Logf, "", dockerfile,
-					buildArgs, []string{}, kanikoImage, contextDir, config.gcsBucket,
+					buildArgs, []string{}, kanikoImage, contextDir, config.gcsBucket, config.gcsClient,
 					config.serviceAccount, false)
 				if *err != nil {
 					return
@@ -94,7 +94,7 @@ func newResult(t *testing.T, f string) result {
 	if err != nil {
 		t.Errorf("could not read benchmark file %s", f)
 	}
-	byteValue, _ := ioutil.ReadAll(jsonFile)
+	byteValue, _ := io.ReadAll(jsonFile)
 	if err := json.Unmarshal(byteValue, &current); err != nil {
 		t.Errorf("could not unmarshal benchmark file")
 	}
@@ -160,7 +160,7 @@ func runInGcloud(dir string, num int) (string, error) {
 	}
 
 	// grab gcs and to temp dir and return
-	tmpDir, err := ioutil.TempDir("", fmt.Sprintf("%d", num))
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("%d", num))
 	if err != nil {
 		return "", err
 	}
@@ -169,7 +169,7 @@ func runInGcloud(dir string, num int) (string, error) {
 	copyCommand := exec.Command("gsutil", "cp", src, dest)
 	_, err = RunCommandWithoutTest(copyCommand)
 	if err != nil {
-		return "", fmt.Errorf("failed to download file to GCS bucket %s: %s", src, err)
+		return "", fmt.Errorf("failed to download file to GCS bucket %s: %w", src, err)
 	}
 	return tmpDir, nil
 }
